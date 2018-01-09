@@ -14,6 +14,8 @@ import (
 
 	"github.com/qiniu/log"
 	"github.com/qiniu/logkit/conf"
+	"github.com/qiniu/logkit/metric"
+	"github.com/qiniu/logkit/utils"
 	"github.com/qiniu/pandora-go-sdk/base/reqerr"
 )
 
@@ -23,11 +25,14 @@ type InfluxdbSender struct {
 	host        string
 	db          string
 	retention   string
+	isMetric    bool
 	measurement string
 	tags        map[string]string // key为tag的列名,value为alias名
 	fields      map[string]string // key为field的列名，value为alias名
 	timestamp   string            // 时间戳列名
 	timePrec    int64
+
+	extraInfo map[string]string
 }
 
 // Influxdb sender 的可配置字段
@@ -35,6 +40,7 @@ const (
 	KeyInfluxdbHost               = "influxdb_host"
 	KeyInfluxdbDB                 = "influxdb_db"
 	KeyInfluxdbRetetion           = "influxdb_retention"
+	KeyInfluxdbIsMetric           = "influxdb_isMetric"
 	KeyInfluxdbMeasurement        = "influxdb_measurement"
 	KeyInfluxdbTags               = "influxdb_tags"
 	KeyInfluxdbFields             = "influxdb_fields"              // influxdb
@@ -52,17 +58,20 @@ func NewInfluxdbSender(c conf.MapConf) (s Sender, err error) {
 	if err != nil {
 		return
 	}
-	measurement, err := c.GetString(KeyInfluxdbMeasurement)
-	if err != nil {
-		return
+	isMetric := false
+	_isMetric, _ := c.GetStringOr(KeyInfluxdbIsMetric, "false")
+	if _isMetric == "true" {
+		isMetric = true
 	}
-	fields, err := c.GetAliasMap(KeyInfluxdbFields)
-	if err != nil {
-		return
-	}
+	measurement, _ := c.GetStringOr(KeyInfluxdbMeasurement, "")
 	tags, _ := c.GetAliasMapOr(KeyInfluxdbTags, make(map[string]string))
+
+	fields := make(map[string]string)
+	if fields, err = c.GetAliasMap(KeyInfluxdbFields); err != nil && !isMetric {
+		return
+	}
 	retention, _ := c.GetStringOr(KeyInfluxdbRetetion, "")
-	timestamp, _ := c.GetStringOr(KeyInfluxdbTimestamp, "")
+	timestamp, _ := c.GetStringOr(KeyInfluxdbTimestamp, "timestamp")
 	prec, _ := c.GetIntOr(KeyInfluxdbTimestampPrecision, 1)
 	name, _ := c.GetStringOr(KeyName, fmt.Sprintf("influxdbSender:(%v,db:%v,measurement:%v", host, db, measurement))
 
@@ -71,11 +80,13 @@ func NewInfluxdbSender(c conf.MapConf) (s Sender, err error) {
 		host:        host,
 		db:          db,
 		retention:   retention,
+		isMetric:    isMetric,
 		measurement: measurement,
 		tags:        tags,
 		fields:      fields,
 		timestamp:   timestamp,
 		timePrec:    int64(prec),
+		extraInfo:   utils.GetExtraInfo(),
 	}, nil
 }
 
@@ -90,7 +101,13 @@ func (s *InfluxdbSender) Close() error {
 func (s *InfluxdbSender) Send(datas []Data) error {
 	ps := Points{}
 	for _, d := range datas {
-		p, err := s.makePoint(d)
+		var p Point
+		var err error
+		if s.isMetric {
+			p, err = s.makeMetricsPoint(d)
+		} else {
+			p, err = s.makePoint(d)
+		}
 		if err != nil {
 			log.Warnf("%s make point format err : %v", s.Name(), err)
 			continue
@@ -142,6 +159,81 @@ func (s *InfluxdbSender) sendPoints(ps Points) (err error) {
 		err = fmt.Errorf(strings.Replace(string(b), "\\", "", -1))
 		return
 	}
+	return
+}
+
+func (s *InfluxdbSender) makeMetricsPoint(d Data) (p Point, err error) {
+	p.Time = 0
+	seriesName := s.measurement
+	for k, _ := range d {
+		index := strings.Index(k, "__")
+		if index > 0 && strings.Index(k[0:index], "_") == -1 {
+			seriesName = k[0:index]
+			break
+		}
+	}
+	data := make(map[string]interface{})
+	for k, v := range d {
+		if strings.HasPrefix(k, seriesName+"__") {
+			data[strings.Replace(k, "__", "_", 1)] = v
+			continue
+		}
+		data[k] = v
+	}
+
+	if s.measurement != "" {
+		p.Measurement = s.measurement
+	} else {
+		p.Measurement = seriesName
+	}
+	tags := make(map[string]string)
+	// 将 osInfo 添加到每个 Point 的 tags 中
+	for k, v := range s.extraInfo {
+		tags[k] = v
+	}
+	for _, tag := range metric.GetMetricTags()[seriesName] {
+		_, exist := s.tags[tag]
+		if !exist {
+			s.tags[tag] = tag
+		}
+	}
+
+	for k, t := range s.tags {
+		v, exist := data[k]
+		if !exist {
+			log.Debugf("%s tag %s not exist", s.Name(), t)
+			continue
+		}
+		tags[t] = fmt.Sprintf("%v", v)
+		delete(d, k) //去除已经处理的tag
+	}
+	p.Tags = tags
+	fields := map[string]interface{}{}
+	if len(s.fields) > 0 {
+		for k, f := range s.fields {
+			v, exist := data[k]
+			if !exist {
+				log.Debugf("%s field %s not exist", s.Name(), f)
+				continue
+			}
+			fields[f] = v
+		}
+	} else { //当不配置fields字段时，默认发所有的收集到的字段
+		for k, v := range data {
+			fields[k] = v
+		}
+	}
+	if len(fields) <= 0 {
+		return p, errors.New("must contain at least 1 field ")
+	}
+	p.Fields = fields
+
+	t, exist := d[s.timestamp]
+	t1, succ := t.(int64)
+	if exist && succ {
+		p.Time = t1 * s.timePrec
+	}
+
 	return
 }
 
